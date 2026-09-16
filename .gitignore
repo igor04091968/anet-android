@@ -10,4 +10,5 @@
 local.properti
 *.so
 /jniLibs
+/app/src/main/assets/default-client.toml
 /app/keystore/*.jks

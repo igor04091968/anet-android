@@ -1857,6 +1857,20 @@ timeout_secs = 10$sshLine
                 val item = ConfigItem(name = oldName ?: "Config 1", content = oldContent)
                 configs.add(item)
                 saveConfigsToPrefs(configs, item.id)
+            } else {
+                // Локальная операторская сборка может содержать приватный конфиг
+                // в assets/default-client.toml. В публичной сборке этого файла нет.
+                try {
+                    val bundled = assets.open("default-client.toml").bufferedReader().use { it.readText() }
+                    if (inspectServers(bundled, reportError = false) != null) {
+                        val item = ConfigItem(name = "gw2 (встроенный)", content = bundled)
+                        configs.add(item)
+                        saveConfigsToPrefs(configs, item.id)
+                        logToConsole("Загружен встроенный конфиг шлюза")
+                    }
+                } catch (_: Exception) {
+                    // В обычной публичной сборке встроенный конфиг отсутствует.
+                }
             }
         }
 
