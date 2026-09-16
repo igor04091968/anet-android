@@ -54,7 +54,9 @@ import java.io.File
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.SecureRandom
 import java.util.UUID
+import android.util.Base64
 
 // Вспомогательная структура данных для парсинга нод в Kotlin
 data class ServerModel(val id: String, val name: String) {
@@ -65,7 +67,7 @@ data class ServerModel(val id: String, val name: String) {
 data class ConfigItem(
     val id: String = UUID.randomUUID().toString(),
     var name: String,
-    val content: String
+    var content: String
 )
 
 class MainActivity : AppCompatActivity() {
@@ -1258,6 +1260,19 @@ class MainActivity : AppCompatActivity() {
 
         rootLayout.addView(headerLayout)
         rootLayout.addView(btnAddConfigLayout)
+
+        val btnCreateConfig = Button(this).apply {
+            text = "Создать конфигурацию шлюза"
+            setTextColor(Color.parseColor("#00E676"))
+            setBackgroundColor(Color.TRANSPARENT)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, 12.dpToPx()) }
+            setupTvFocusAnimator()
+            setOnClickListener { showCreateConfigDialog { refreshConfigListRunnable?.run() } }
+        }
+        rootLayout.addView(btnCreateConfig)
         rootLayout.addView(sectionTitle)
         rootLayout.addView(scrollView)
 
@@ -1342,7 +1357,7 @@ class MainActivity : AppCompatActivity() {
                         setMargins(12.dpToPx(), 0, 12.dpToPx(), 0)
                     }
                     setOnClickListener {
-                        showRenameDialog(item) {
+                        showConfigEditorDialog(item) {
                             populateList()
                         }
                     }
@@ -1403,6 +1418,99 @@ class MainActivity : AppCompatActivity() {
             // Убираем системный фон диалога, который оставляет стандартные рамки по бокам
             setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
         }
+    }
+
+    private fun generatedClientKey(): String {
+        val seed = ByteArray(32)
+        SecureRandom().nextBytes(seed)
+        return Base64.encodeToString(seed, Base64.NO_WRAP)
+    }
+
+    private fun showCreateConfigDialog(onUpdated: () -> Unit) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24.dpToPx(), 20.dpToPx(), 24.dpToPx(), 12.dpToPx())
+        }
+        fun field(hint: String, value: String = "", secret: Boolean = false): EditText = EditText(this).apply {
+            this.hint = hint
+            setText(value)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setSingleLine(true)
+            if (secret) inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setPadding(12.dpToPx(), 10.dpToPx(), 12.dpToPx(), 10.dpToPx())
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 4.dpToPx(), 0, 4.dpToPx()) }
+        }
+        val name = field("Имя шлюза", "gw2")
+        val dsn = field("DSN: quic://host:port, ssh://host:port, wss://host/path")
+        val serverKey = field("Публичный ключ сервера (Base64)", secret = true)
+        val sshUser = field("Пользователь SSH (необязательно)")
+        val key = field("Сгенерированный private_key", generatedClientKey(), secret = true)
+        val regenerate = Button(this).apply {
+            text = "Перегенерировать ключ клиента"
+            setTextColor(Color.parseColor("#FFCC80"))
+            setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener { key.setText(generatedClientKey()) }
+        }
+        box.addView(name); box.addView(dsn); box.addView(serverKey); box.addView(sshUser); box.addView(key); box.addView(regenerate)
+        val dialog = AlertDialog.Builder(this).setTitle("Новый шлюз ANet").setView(box).setNegativeButton("Отмена", null).setPositiveButton("Сохранить", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val n = name.text.toString().trim(); val endpoint = dsn.text.toString().trim(); val sk = serverKey.text.toString().trim(); val pk = key.text.toString().trim()
+                if (n.isEmpty() || endpoint.isEmpty() || sk.isEmpty() || pk.isEmpty()) { showErrorDialog("Заполните имя, DSN, server_pub_key и private_key"); return@setOnClickListener }
+                if (!endpoint.matches(Regex("(?i)(quic|ssh|vnc|ws|wss|http|https)://.+"))) { showErrorDialog("DSN должен начинаться с quic://, ssh://, vnc://, ws:// или https://"); return@setOnClickListener }
+                val sshLine = if (sshUser.text.toString().trim().isEmpty()) "" else "\\nssh_user = \"${sshUser.text.toString().trim().replace("\\\"", "") }\""
+                val content = """[main]
+tun_name = "anet-client"
+manual_routing = false
+dns_server_list = ["1.1.1.1", "8.8.8.8"]
+
+[keys]
+private_key = "$pk"
+server_pub_key = "$sk"
+
+[[servers]]
+name = "$n"
+dsn = "$endpoint"
+timeout_secs = 10$sshLine
+"""
+                if (inspectServers(content, reportError = true) == null) return@setOnClickListener
+                addAndActivateConfig(n, content); logToConsole("Создан шлюз: $n"); onUpdated(); dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun showConfigEditorDialog(item: ConfigItem, onUpdated: () -> Unit) {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16.dpToPx(), 8.dpToPx(), 16.dpToPx(), 8.dpToPx()) }
+        val editor = EditText(this).apply {
+            setText(item.content); setTextColor(Color.WHITE); setHintTextColor(Color.GRAY); gravity = android.view.Gravity.TOP; typeface = android.graphics.Typeface.MONOSPACE
+            minLines = 16; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        val regenerate = Button(this).apply {
+            text = "Перегенерировать private_key"
+            setTextColor(Color.parseColor("#FFCC80")); setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener {
+                val replacement = "private_key = \"${generatedClientKey()}\""
+                val updated = editor.text.toString().replace(Regex("(?m)^\\s*private_key\\s*=\\s*\"[^\"]*\"\\s*$"), replacement)
+                editor.setText(updated); editor.setSelection(updated.length)
+            }
+        }
+        box.addView(editor, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0).apply { weight = 1f }); box.addView(regenerate)
+        val dialog = AlertDialog.Builder(this).setTitle("Редактирование: ${item.name}").setView(box).setNegativeButton("Отмена", null).setPositiveButton("Сохранить", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val content = editor.text.toString()
+                if (inspectServers(content, reportError = true) == null) return@setOnClickListener
+                val wasActive = getSharedPreferences("anet_prefs", Context.MODE_PRIVATE).getString("active_config_id", null) == item.id
+                item.content = content
+                val configs = getSavedConfigs(); val target = configs.find { it.id == item.id }; if (target != null) target.content = content
+                saveConfigsToPrefs(configs, getSharedPreferences("anet_prefs", Context.MODE_PRIVATE).getString("active_config_id", null))
+                if (wasActive) { selectedConfigContent = content; saveConfigToPrefs(content, item.name); setupServerSelector() }
+                logToConsole("Конфигурация изменена: ${item.name}"); onUpdated(); dialog.dismiss()
+            }
+        }
+        dialog.show()
     }
 
     private fun showRenameDialog(item: ConfigItem, onUpdated: () -> Unit) {
