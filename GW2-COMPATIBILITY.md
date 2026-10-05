@@ -1,4 +1,7 @@
-# gw2 protocol compatibility
+# Historical gw2 Android compatibility investigation
+
+This note describes a previous legacy-gateway test, not the native source used by ANet 1.0.3. Current native source is `../anet-vpn`, branch `feature/android-diagnostics-tuning-20261005`; use imported profiles matching the live GOST/new server. No production server or laptop route was changed for the new diagnostics/tuning release.
+
 
 The live gateway at UDP 144.31.85.160:443 uses the pre-billing protobuf
 envelope: message fields 1–6, padding bytes in field 7. A bounded phase-I
