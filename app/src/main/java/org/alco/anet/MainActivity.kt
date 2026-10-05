@@ -1286,8 +1286,10 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, ANetVpnService::class.java)
         intent.action = ANetVpnService.ACTION_CONNECT
         val source = selectedConfigContent ?: return
-        intent.putExtra("CONFIG", connectionConfigForCurrentNetwork(source))
-        intent.putExtra("SELECTED_SERVER", selectedServerName)
+        val connectionConfig = connectionConfigForCurrentNetwork(source)
+        intent.putExtra("CONFIG", connectionConfig)
+        // The tuned copy already scopes the group and ranks its endpoints.
+        intent.putExtra("SELECTED_SERVER", if (connectionConfig == source) selectedServerName else "")
 
         val prefs = getSharedPreferences("anet_prefs", Context.MODE_PRIVATE)
         val appsSet = prefs.getStringSet("allowed_apps", emptySet())
