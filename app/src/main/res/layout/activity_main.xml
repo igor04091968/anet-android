@@ -125,6 +125,26 @@
             app:iconPadding="@dimen/icon_padding"
             app:iconSize="32dp"
             app:iconTint="#FFFFFF" />
+
+        <Button
+            android:id="@+id/vpnPermissionMenu"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_weight="1"
+            android:background="@android:color/transparent"
+            android:clickable="true"
+            android:focusable="true"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:padding="0dp"
+            android:text="VPN"
+            android:textColor="@color/buttons_icon_color"
+            android:textSize="@dimen/button_font_size"
+            app:icon="@drawable/ic_settings"
+            app:iconGravity="textTop"
+            app:iconPadding="@dimen/icon_padding"
+            app:iconSize="32dp"
+            app:iconTint="#FFFFFF" />
     </LinearLayout>
 
     <!-- Панель информации об аккаунте (Тариф) -->
@@ -173,7 +193,7 @@
             android:baselineAligned="false"
             android:orientation="horizontal"
             android:weightSum="3">
-            
+
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -384,6 +404,8 @@
         </LinearLayout>
 
         <!-- Компактная кнопка открытия логов (справа) -->
+
+
         <Button
             android:id="@+id/btnShowLogs"
             android:layout_width="wrap_content"
@@ -401,6 +423,8 @@
 
     </LinearLayout>
     <!--    Панель статистики-->
+
+
     <LinearLayout
         android:id="@+id/statsContainer"
         android:layout_width="match_parent"
@@ -416,6 +440,15 @@
         app:layout_constraintBottom_toBottomOf="parent"
         tools:layout_editor_absoluteX="16dp"
         android:layout_marginBottom="16dp">
+        <Button
+            android:id="@+id/btnDiagnostics"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="Диагностика"
+            android:textSize="12sp"
+            android:backgroundTint="#333333"
+            android:textColor="#ffffff" />
+
 
         <!-- Верхний ряд: RTT, Download, Upload -->
         <LinearLayout

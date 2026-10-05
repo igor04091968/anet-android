@@ -1,4 +1,7 @@
 # Add project specific ProGuard rules here.
+# Rust calls these classes' callback methods by literal JNI names.
+-keep class org.alco.anet.ANetVpnService { *; }
+-keep class org.alco.anet.MainActivity { *; }
 # You can control the set of applied configuration files using the
 # proguardFiles setting in build.gradle.
 #

@@ -6,6 +6,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.os.Build.*
 import java.net.InetAddress
 import android.content.pm.ServiceInfo
@@ -28,6 +29,7 @@ class ANetVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var lastNetwork: Network? = null
+    private var networkLost = false
 
     // Поколение TUN-интерфейса. Защищает от гонки: отложенный closeTun(),
     // запощенный по статусу "Reconnecting", не должен закрыть УЖЕ НОВЫЙ
@@ -46,6 +48,7 @@ class ANetVpnService : VpnService() {
         }
         @Volatile
         var isServiceRunning: Boolean = false
+        @Volatile var diagnosticService: ANetVpnService? = null
 
         @Volatile
         private var lastConfigCache: String? = null
@@ -84,6 +87,7 @@ class ANetVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
+        diagnosticService = this
         initLogger()
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
@@ -102,6 +106,8 @@ class ANetVpnService : VpnService() {
             .setContentTitle("ANet VPN")
             .setContentText("Connecting...")
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(openAppIntent())
+            .addAction(0, "Остановить", stopVpnIntent())
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
@@ -221,30 +227,26 @@ class ANetVpnService : VpnService() {
             networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     super.onAvailable(network)
-                    val capabilities = connectivityManager.getNetworkCapabilities(network)
-                    if (capabilities != null && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                        Log.i("ANet", "Ignoring VPN network callback to prevent infinite routing loop")
+                    Log.i("ANet", "Network available; waiting for capabilities: $network")
+                }
+
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                    super.onCapabilitiesChanged(network, capabilities)
+                    if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                        Log.i("ANet", "Ignoring VPN network callback to prevent routing loop")
                         return
                     }
-
-                    val isNetworkSwitch = lastNetwork != null && lastNetwork != network
+                    if (network == lastNetwork) return
+                    val isNetworkSwitch = lastNetwork != null || networkLost
                     lastNetwork = network
+                    networkLost = false
                     Log.i("ANet", "Active physical network: $network (switch=$isNetworkSwitch)")
-
-                    try {
-                        setUnderlyingNetworks(arrayOf(network))
-                    } catch (e: Exception) {
+                    try { setUnderlyingNetworks(arrayOf(network)) } catch (e: Exception) {
                         Log.e("ANet", "Failed to set underlying networks: ${e.message}")
                     }
-
                     if (isNetworkSwitch && !isShuttingDown) {
-                        Log.i("ANet", "Physical network switched! Triggering reconnect to bind to new network route...")
                         onStatusChanged("Сеть изменилась, переподключение...")
-                        mainHandler.postDelayed({
-                            if (!isShuttingDown) {
-                                Thread { reconnectVpn() }.start()
-                            }
-                        }, 500)
+                        mainHandler.postDelayed({ if (!isShuttingDown) Thread { reconnectVpn() }.start() }, 500)
                     }
                 }
 
@@ -253,16 +255,19 @@ class ANetVpnService : VpnService() {
                     Log.i("ANet", "Physical network lost: $network")
                     if (lastNetwork == network) {
                         lastNetwork = null
-                    }
-                    try {
-                        setUnderlyingNetworks(null)
-                    } catch (e: Exception) {
-                        Log.e("ANet", "Failed to clear underlying networks: ${e.message}")
+                        networkLost = true
+                        try { setUnderlyingNetworks(null) } catch (e: Exception) {
+                            Log.e("ANet", "Failed to clear lost underlying network: ${e.message}")
+                        }
                     }
                 }
             }
             try {
-                connectivityManager.registerDefaultNetworkCallback(networkCallback!!)
+                if (VERSION.SDK_INT >= VERSION_CODES.O) {
+                    connectivityManager.registerDefaultNetworkCallback(networkCallback!!, mainHandler)
+                } else {
+                    connectivityManager.registerDefaultNetworkCallback(networkCallback!!)
+                }
             } catch (e: Exception) {
                 Log.e("ANet", "Failed to register default network callback", e)
             }
@@ -279,6 +284,7 @@ class ANetVpnService : VpnService() {
             networkCallback = null
         }
         lastNetwork = null
+        networkLost = false
     }
 
     @Synchronized
@@ -370,7 +376,13 @@ class ANetVpnService : VpnService() {
 
         try {
             vpnInterface = builder.establish()
-            return vpnInterface?.fd ?: -1
+            return try {
+                vpnInterface?.let { ParcelFileDescriptor.dup(it.fileDescriptor).detachFd() } ?: -1
+            } catch (e: Exception) {
+                Log.e("ANet", "Failed to duplicate TUN descriptor", e)
+                closeTun()
+                -1
+            }
         } catch (e: Exception) {
             Log.e("ANet", "Establish failed", e)
             return -1
@@ -499,10 +511,24 @@ class ANetVpnService : VpnService() {
             .setContentTitle("ANet VPN")
             .setContentText(status)
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(openAppIntent())
+            .addAction(0, "Остановить", stopVpnIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
         try { nm?.notify(1337, n) } catch (e: SecurityException) {}
+    }
+
+    private fun openAppIntent(): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        return PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    }
+
+    private fun stopVpnIntent(): PendingIntent {
+        val intent = Intent(this, ANetVpnService::class.java).apply { action = ACTION_STOP }
+        return PendingIntent.getService(this, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 
     private fun stopVpnInternal() {
@@ -547,6 +573,7 @@ class ANetVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        if (diagnosticService === this) diagnosticService = null
         isServiceRunning = false
         releaseLocks()
         val intent = Intent("org.alco.anet.VPN_STATUS").apply {

@@ -5,6 +5,7 @@ plugins {
 
 android {
     namespace = "org.alco.anet"
+    ndkVersion = "25.2.9519653"
     compileSdk {
         version = release(34)
     }
@@ -44,6 +45,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".diagnostics"
+            versionNameSuffix = "-diagnostics"
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(
@@ -53,6 +58,8 @@ android {
             signingConfig = signingConfigs.getByName("release")
         }
     }
+    packaging { jniLibs { useLegacyPackaging = true } }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11

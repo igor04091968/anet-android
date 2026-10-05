@@ -12,6 +12,9 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- ANet is a VPN client. Consent is granted by Android via
+         VpnService.prepare(), not as a normal runtime permission. -->
+
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -31,7 +34,7 @@
         android:usesCleartextTraffic="true">
 
         <activity
-            android:name="org.alco.anet.MainActivity"
+            android:name=".MainActivity"
             android:exported="true" >
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -60,7 +63,7 @@
             android:name=".ANetVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:foregroundServiceType="specialUse"
-            android:exported="false">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

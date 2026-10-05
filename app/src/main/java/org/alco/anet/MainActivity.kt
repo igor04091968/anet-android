@@ -86,6 +86,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnScanQr: Button
     private lateinit var btnCheckUpdate: Button
     private lateinit var btnShowLogs: Button
+    private lateinit var vpnPermissionMenu: Button
 
     private lateinit var serverSelectContainer: LinearLayout
     private lateinit var serverSelectTextView: TextView
@@ -111,6 +112,7 @@ class MainActivity : AppCompatActivity() {
     private var currentUiState = State.DISCONNECTED
     private var updateDialog: AlertDialog? = null
     private var progressBar: ProgressBar? = null
+    private var connectAfterVpnPermission = true
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val connectTimeoutRunnable = Runnable {
@@ -134,6 +136,316 @@ class MainActivity : AppCompatActivity() {
     private external fun inspectConfig(config: String): String
     private external fun getVpnStateCode(): Int
     private external fun getVpnServerName(): String
+    private external fun startDiagnostics(config: String, options: String): Long
+    private external fun cancelDiagnostics()
+    private external fun getDiagnosticsReport(): String
+    private external fun planDiagnosticSettings(config: String, report: String, selection: String): String
+    private external fun applyDiagnosticSettings(config: String, report: String, selection: String, candidate: Int): String
+    private external fun getConnectionVerification(): String
+    private var pendingTuning: JSONObject? = null
+    private var tuningVerificationGeneration = 0
+    private val tuningLifetimeMs = 30 * 60 * 1000L
+    @Volatile private var diagnosticNetwork: android.net.Network? = null
+    private var diagnosticDialog: AlertDialog? = null
+
+    @Keep
+    fun resolveDiagnosticHost(host: String): String = try {
+        diagnosticNetwork?.getAllByName(host)?.joinToString("\n") { it.hostAddress ?: "" } ?: ""
+    } catch (_: Exception) { "" }
+
+    @Keep
+    fun prepareDiagnosticSocket(fd: Int): Boolean = try {
+        val network = diagnosticNetwork
+        if (network == null) false else {
+            val service = ANetVpnService.diagnosticService
+            if (service != null && !service.protect(fd)) false else {
+                // fromFd duplicates the original: closing the wrapper does not close Rust's socket.
+                android.os.ParcelFileDescriptor.fromFd(fd).use { network.bindSocket(it.fileDescriptor) }
+                true
+            }
+        }
+    } catch (_: Exception) { false }
+
+    private fun showDiagnosticsDialog() {
+        val config = selectedConfigContent ?: run { showErrorDialog("Выберите конфигурацию ANet"); return }
+        AlertDialog.Builder(this).setTitle("Диагностика соединения")
+            .setMessage("Быстрая: DNS, TCP, TLS наших серверов. Расширенная: TLS-отпечатки и до 4 параллельных соединений в пределах N. Она может вызвать временную блокировку. Настройки VPN не изменяются.")
+            .setPositiveButton("Быстрая") { _, _ -> runDiagnostics(config, false) }
+            .setNeutralButton("Расширенная") { _, _ -> runDiagnostics(config, true) }
+            .setNegativeButton("Исходные настройки") { _, _ ->
+                if (currentUiState != State.DISCONNECTED) {
+                    showErrorDialog("Сначала остановите VPN, затем сбросьте подбор.")
+                } else {
+                    pendingTuning = null
+                    tuningVerificationGeneration++
+                    getSharedPreferences("anet_prefs", Context.MODE_PRIVATE).edit().remove("connection_tuning").apply()
+                    logToConsole("Подбор сброшен. Следующее подключение — с исходными настройками.")
+                }
+            }.show()
+    }
+
+    private fun runDiagnostics(config: String, extended: Boolean) {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val activeCaps = cm.getNetworkCapabilities(cm.activeNetwork)
+        if (activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true && ANetVpnService.diagnosticService == null) {
+            showErrorDialog("Активен VPN другого приложения. Для проверки физической сети сначала отключите его вручную.")
+            return
+        }
+        if (getDiagnosticsReport() == "RUNNING") { showErrorDialog("Диагностика уже выполняется"); return }
+        diagnosticNetwork = cm.allNetworks.sortedByDescending {
+            val caps = cm.getNetworkCapabilities(it)
+            (if (it == cm.activeNetwork) 4 else 0) +
+                (if (caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) 2 else 0) +
+                (if (caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true) 1 else 0)
+        }.firstOrNull { network ->
+            val caps = cm.getNetworkCapabilities(network)
+            caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }
+        val network = diagnosticNetwork ?: run { showErrorDialog("Нет доступной физической сети"); return }
+        val caps = cm.getNetworkCapabilities(network)
+        val kind = when {
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true -> "wifi"
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "cellular"
+            else -> "other"
+        }
+        val validated = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val options = JSONObject().put("extended", extended)
+            .put("helper_path", File(applicationInfo.nativeLibraryDir, "libanet_dpi.so").absolutePath)
+            .put("network_context", "android:${network.networkHandle}:$kind:validated=$validated")
+        val job = startDiagnostics(config, options.toString())
+        if (job < 0) { showErrorDialog(if (job == -2L) "Диагностика уже выполняется" else "Не удалось запустить диагностику"); return }
+        // Activity text colors can be unreadable on the dialog's fixed dark surface.
+        // Use the dialog context and an explicit paired palette in both day/night modes.
+        val builder = AlertDialog.Builder(this)
+        val density = resources.displayMetrics.density
+        val padding = (16 * density).toInt()
+        val text = TextView(builder.context).apply {
+            textSize = 14f
+            setTextColor(android.graphics.Color.rgb(255, 100, 0))
+            setPadding(padding, padding, padding, padding)
+            setTextIsSelectable(true)
+            text = "Проверки выполняются…\nОтмена доступна в любой момент."
+        }
+        val reportHeight = (resources.displayMetrics.heightPixels * 0.42f).toInt()
+            .coerceIn((160 * density).toInt(), (400 * density).toInt())
+        val scroll = ScrollView(builder.context).apply {
+            setBackgroundColor(android.graphics.Color.rgb(32, 32, 32))
+            isFillViewport = true
+            addView(text, android.widget.FrameLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        val content = LinearLayout(builder.context).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(scroll, LinearLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, reportHeight
+            ))
+        }
+        val dialog = builder.setTitle("Диагностика ANet").setView(content)
+            .setNegativeButton("Отмена", null).setPositiveButton("Поделиться JSON", null)
+            .setNeutralButton("Подобрать настройки", null).create()
+        diagnosticDialog = dialog
+        dialog.setOnDismissListener { cancelDiagnostics(); diagnosticDialog = null }
+        dialog.show()
+        var cancelling = false
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+            cancelling = true
+            cancelDiagnostics()
+            text.text = "Отмена: ожидаем закрытия диагностических сокетов…"
+        }
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled = false
+        val sourceSelection = selectedServerName
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        val handler = Handler(Looper.getMainLooper())
+        val poll = object : Runnable {
+            override fun run() {
+                if (!dialog.isShowing) return
+                val report = getDiagnosticsReport()
+                if (report == "RUNNING" || report.isEmpty()) {
+                    val elapsed = (android.os.SystemClock.elapsedRealtime() - startedAt) / 1000
+                    text.text = if (cancelling) "Отмена: ожидаем закрытия диагностических сокетов… (${elapsed} с)"
+                        else "Проверки выполняются: ${elapsed} с\nРежим: ${if (extended) "расширенный" else "быстрый"}.\nОтмена доступна в любой момент."
+                    handler.postDelayed(this, 500)
+                    return
+                }
+                text.text = formatDiagnosticReport(report)
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled = !JSONObject(report).optBoolean("cancelled")
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                    showDiagnosticTuning(config, report, sourceSelection)
+                }
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).text = "Закрыть"
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener { dialog.dismiss() }
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = true
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val file = File(cacheDir, "anet-diagnostics.json").apply { writeText(report) }
+                    val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.fileprovider", file)
+                    startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                        type = "application/json"; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }, "Отчёт диагностики"))
+                }
+            }
+        }
+        handler.post(poll)
+    }
+
+    private fun currentPhysicalNetworkContext(): String? {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val network = cm.allNetworks.sortedByDescending {
+            val c = cm.getNetworkCapabilities(it)
+            (if (it == cm.activeNetwork) 4 else 0) +
+                (if (c?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) 2 else 0) +
+                (if (c?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true) 1 else 0)
+        }.firstOrNull {
+            val c = cm.getNetworkCapabilities(it)
+            c != null && c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        } ?: return null
+        val caps = cm.getNetworkCapabilities(network)
+        val kind = when {
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true -> "wifi"
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "cellular"
+            else -> "other"
+        }
+        val validated = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        return "android:${network.networkHandle}:$kind:validated=$validated"
+    }
+
+    private fun tuningError(source: String, report: JSONObject, selection: String): String? = when {
+        currentUiState != State.DISCONNECTED -> "Сначала остановите VPN. Работающее соединение автоматически не меняется."
+        selectedConfigContent != source || selectedServerName != selection -> "Профиль или группа изменились. Повторите диагностику."
+        currentPhysicalNetworkContext() != report.optString("network_context") -> "Сеть изменилась. Повторите диагностику в текущей сети."
+        System.currentTimeMillis() - report.optLong("created_at_ms") !in 0..tuningLifetimeMs -> "Результат устарел. Повторите диагностику."
+        else -> null
+    }
+
+    private fun showDiagnosticTuning(source: String, rawReport: String, selection: String) {
+        try {
+            val report = JSONObject(rawReport)
+            tuningError(source, report, selection)?.let { showErrorDialog(it); return }
+            val plan = JSONObject(planDiagnosticSettings(source, rawReport, selection))
+            if (plan.has("error")) { showErrorDialog(plan.getString("error")); return }
+            val candidates = plan.getJSONArray("candidates")
+            val labels = Array(candidates.length()) { i ->
+                val c = candidates.getJSONObject(i)
+                "${i + 1}. ${c.getString("name")} (${c.getString("transport")})\n${c.getString("evidence")}"
+            }
+            AlertDialog.Builder(this).setTitle("Выберите вариант для проверки ANet")
+                .setItems(labels) { _, position ->
+                    val candidate = candidates.getJSONObject(position)
+                    val notes = plan.getJSONArray("notes")
+                    val description = buildString {
+                        append("Сервер: ${candidate.getString("name")}\n")
+                        append("Внешних соединений не более: ${plan.getInt("max_connections")}\n")
+                        append("Интервал новых соединений: ${plan.getLong("min_connect_interval_ms")} мс\n")
+                        append("Параллельность AHTTP: ${plan.getInt("ahttp_concurrency")}\n\n")
+                        for (i in 0 until notes.length()) append(notes.getString(i)).append("\n\n")
+                        append("Исходный конфиг сохраняется. Подбор действует только в этой сети, до 30 минут. При неудаче можно вернуться к исходным настройкам.")
+                    }
+                    AlertDialog.Builder(this).setTitle("Подбор настроек соединения").setMessage(description)
+                        .setNegativeButton("Отмена", null)
+                        .setNeutralButton("Исходные настройки") { _, _ ->
+                            pendingTuning = null
+                            getSharedPreferences("anet_prefs", Context.MODE_PRIVATE).edit().remove("connection_tuning").apply()
+                            logToConsole("Подбор сброшен; следующий запуск использует исходный конфиг.")
+                        }
+                        .setPositiveButton("Применить и подключить") { _, _ ->
+                            tuningError(source, report, selection)?.let { showErrorDialog(it); return@setPositiveButton }
+                            val applied = JSONObject(applyDiagnosticSettings(source, rawReport, selection, candidate.getInt("index")))
+                            if (applied.has("error")) { showErrorDialog(applied.getString("error")); return@setPositiveButton }
+                            pendingTuning = JSONObject().put("report", report).put("selection", selection)
+                                .put("candidate", candidate.getInt("index")).put("saved_at", System.currentTimeMillis())
+                                .put("auth_verified", false)
+                            diagnosticDialog?.dismiss()
+                            logToConsole("Применён предварительный подбор; проверяем настоящее подключение ANet. Исходный профиль сохранён.")
+                            checkPermissionsAndStart()
+                        }.show()
+                }.setNegativeButton("Закрыть", null).show()
+        } catch (_: Exception) { showErrorDialog("Не удалось прочитать подбор. Повторите диагностику.") }
+    }
+
+    private fun verifyAppliedTuning() {
+        val tuning = pendingTuning ?: return
+        val source = selectedConfigContent ?: return
+        val started = android.os.SystemClock.elapsedRealtime()
+        val generation = ++tuningVerificationGeneration
+        val poll = object : Runnable {
+            override fun run() {
+                if (pendingTuning !== tuning || generation != tuningVerificationGeneration || currentUiState == State.DISCONNECTED) return
+                if (selectedConfigContent != source || selectedServerName != tuning.optString("selection")) { pendingTuning = null; return }
+                if (tuning.getJSONObject("report").optString("network_context") != currentPhysicalNetworkContext()) {
+                    pendingTuning = null
+                    logToConsole("Сеть изменилась: результат подбора не сохраняется.")
+                    return
+                }
+                try {
+                    val verification = JSONObject(getConnectionVerification())
+                    if (currentUiState == State.CONNECTED && verification.optBoolean("authenticated") && verification.optBoolean("data_verified")) {
+                        val plan = JSONObject(planDiagnosticSettings(source, tuning.getJSONObject("report").toString(), tuning.getString("selection")))
+                        val candidates = plan.getJSONArray("candidates")
+                        val actual = (0 until candidates.length()).map { candidates.getJSONObject(it) }
+                            .firstOrNull { it.optString("dsn") == verification.optString("dsn") }
+                        if (actual != null) {
+                            tuning.put("candidate", actual.getInt("index")).put("auth_verified", true)
+                                .put("data_verified", true).put("verification", verification)
+                            getSharedPreferences("anet_prefs", Context.MODE_PRIVATE).edit().putString("connection_tuning", tuning.toString()).apply()
+                            logToConsole("Подбор подтверждён: ${verification.optString("server_name")}, ${verification.optString("transport")}, MTU ${verification.optInt("mtu")}; принято не менее 64 КБ через туннель. Сохранено для этой сети на 30 минут.")
+                        }
+                        pendingTuning = null
+                        return
+                    }
+                } catch (_: Exception) { pendingTuning = null; return }
+                if (android.os.SystemClock.elapsedRealtime() - started < 120000) mainHandler.postDelayed(this, 1000)
+                else {
+                    pendingTuning = null
+                    logToConsole("Авторизация не доказывает передачу данных: подбор не сохранён без приёма 64 КБ. Повторите диагностику или используйте исходный профиль.")
+                }
+            }
+        }
+        mainHandler.post(poll)
+    }
+
+    private fun connectionConfigForCurrentNetwork(source: String): String {
+        val prefs = getSharedPreferences("anet_prefs", Context.MODE_PRIVATE)
+        val saved = try { prefs.getString("connection_tuning", null)?.let { JSONObject(it) } } catch (_: Exception) { null }
+        val tuning = pendingTuning ?: saved?.takeIf { it.optBoolean("auth_verified") && it.optBoolean("data_verified") } ?: return source
+        try {
+            val age = System.currentTimeMillis() - tuning.getLong("saved_at")
+            val report = tuning.getJSONObject("report")
+            if (age !in 0..tuningLifetimeMs || tuning.getString("selection") != selectedServerName ||
+                report.optString("network_context") != currentPhysicalNetworkContext()) {
+                pendingTuning = null
+                logToConsole("Подбор устарел или сеть/группа изменились. Используется исходный конфиг.")
+                return source
+            }
+            val result = JSONObject(applyDiagnosticSettings(source, report.toString(), selectedServerName, tuning.getInt("candidate")))
+            if (result.has("error")) { pendingTuning = null; return source }
+            logToConsole("Используется подбор для текущей сети; сервер подтвердит авторизацию и MTU.")
+            return result.getString("config")
+        } catch (_: Exception) { pendingTuning = null; return source }
+    }
+
+    private fun formatDiagnosticReport(raw: String): String = try {
+        val report = JSONObject(raw)
+        val result = StringBuilder(if (report.optBoolean("cancelled")) "Проверка отменена\n" else "Проверка завершена\n")
+        result.append("Лимит N: ").append(report.optInt("max_connections")).append(" (0 — без ограничения)\n\n")
+        val observations = report.getJSONArray("observations")
+        for (i in 0 until observations.length()) {
+            val row = observations.getJSONObject(i)
+            result.append(row.optString("host")).append(":").append(row.optInt("port")).append(" · ")
+                .append(row.optString("stage")).append(row.optJSONObject("details")?.optString("fingerprint")?.let { " ($it)" } ?: "").append(": ").append(when (row.optString("status")) {
+                    "passed" -> "успешно"; "failed" -> "ошибка"; "skipped" -> "пропущено"; "cancelled" -> "отменено"; else -> "недостаточно данных"
+                })
+                .append(" · ").append(row.optString("code")).append("\n")
+        }
+        result.append("\n")
+        val hints = report.getJSONArray("recommendations")
+        for (i in 0 until hints.length()) result.append(hints.getString(i)).append("\n\n")
+        result.toString()
+    } catch (_: Exception) { raw }
+
     private external fun clearUiCallback()
 
     // Enum для состояний UI
@@ -470,11 +782,17 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            startVpnService()
+            if (connectAfterVpnPermission) {
+                startVpnService()
+            } else {
+                logToConsole("VPN permission granted")
+                setUiState(State.DISCONNECTED)
+            }
         } else {
             logToConsole("VPN permission denied")
             setUiState(State.DISCONNECTED)
         }
+        connectAfterVpnPermission = true
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -655,12 +973,17 @@ class MainActivity : AppCompatActivity() {
             ANetVpnService.STATE_RECONNECTING -> setUiState(State.CONNECTING, "RECONNECTING...")
             ANetVpnService.STATE_STOPPING -> setUiState(State.CONNECTING, "STOPPING...")
 
-            ANetVpnService.STATE_CONNECTED -> setUiState(State.CONNECTED)
+            ANetVpnService.STATE_CONNECTED -> {
+                setUiState(State.CONNECTED)
+                verifyAppliedTuning()
+
+            }
 
             ANetVpnService.STATE_DISCONNECTED,
             ANetVpnService.STATE_STOPPED -> setUiState(State.DISCONNECTED)
 
             ANetVpnService.STATE_FAILED -> {
+                pendingTuning = null
                 setUiState(State.DISCONNECTED)
                 if (message.isNotBlank()) showErrorDialog(message)
             }
@@ -709,6 +1032,7 @@ class MainActivity : AppCompatActivity() {
         btnScanQr = findViewById(R.id.btnScanQr)
         btnCheckUpdate = findViewById(R.id.btnCheckUpdate)
         btnShowLogs = findViewById(R.id.btnShowLogs)
+        vpnPermissionMenu = findViewById(R.id.vpnPermissionMenu)
 
         serverSelectContainer = findViewById(R.id.serverSelectContainer)
         serverSelectTextView = findViewById(R.id.serverSelectTextView)
@@ -720,8 +1044,14 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, AppSelectionActivity::class.java))
         }
 
+        findViewById<View>(R.id.btnDiagnostics).setOnClickListener { showDiagnosticsDialog() }
+
         btnShowLogs.setOnClickListener {
             showLogsDialog()
+        }
+
+        vpnPermissionMenu.setOnClickListener {
+            showVpnPermissionMenu()
         }
 
         initLogger()
@@ -730,7 +1060,7 @@ class MainActivity : AppCompatActivity() {
         if (selectedConfigContent != null) {
             logToConsole("Config loaded: $selectedConfigName")
             setupServerSelector()
-            checkBatteryOptimizations()
+            // Do not open battery settings over the initial VPN consent dialog.
         } else {
             logToConsole("Welcome. Please select config file.")
         }
@@ -853,6 +1183,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        diagnosticDialog?.dismiss()
+        pendingTuning = null
+        tuningVerificationGeneration++
+        cancelDiagnostics()
         mainHandler.removeCallbacks(connectTimeoutRunnable)
         unregisterReceiver(statusReceiver)
         clearUiCallback()
@@ -866,6 +1200,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     // --- LOGIC ---
+
+    private fun showVpnPermissionMenu() {
+        val permissionGranted = VpnService.prepare(this) == null
+        val state = if (permissionGranted) "разрешение выдано" else "разрешение не выдано"
+
+        AlertDialog.Builder(this)
+            .setTitle("Управление VPN ($state)")
+            .setItems(arrayOf("Запросить разрешение VPN", "Запретить работу VPN")) { _, which ->
+                when (which) {
+                    0 -> {
+                        val intent = VpnService.prepare(this)
+                        if (intent == null) {
+                            logToConsole("VPN permission is already granted")
+                        } else {
+                            // This menu action only grants consent; it must not
+                            // unexpectedly connect to the selected server.
+                            connectAfterVpnPermission = false
+                            vpnPermissionLauncher.launch(intent)
+                        }
+                    }
+                    1 -> {
+                        if (ANetVpnService.isServiceRunning || currentUiState != State.DISCONNECTED) {
+                            stopVpnService()
+                        }
+                        // Android does not expose a revoke() API for VpnService
+                        // consent. The system VPN screen is the authoritative
+                        // place where the user can disconnect/forget this VPN.
+                        try {
+                            startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                            logToConsole("Откройте ANet в настройках VPN и отключите/забудьте разрешение")
+                        } catch (e: Exception) {
+                            logToConsole("Не удалось открыть настройки VPN: ${e.message}")
+                            showErrorDialog("Откройте системные настройки VPN и отключите ANet вручную.")
+                        }
+                    }
+                }
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
 
     private fun checkPermissionsAndStart() {
         if (selectedConfigContent == null) {
@@ -895,11 +1269,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
+        // Android grants VPN access only after the system confirmation screen
+        // returned by VpnService.prepare(). Keep this guard here as well as in
+        // checkPermissionsAndStart(): reconnect/resume paths can call this
+        // method directly and must never start a VPN service without consent.
+        val vpnPermissionIntent = VpnService.prepare(this)
+        if (vpnPermissionIntent != null) {
+            logToConsole("VPN permission is required. Opening Android confirmation...")
+            setUiState(State.DISCONNECTED)
+            vpnPermissionLauncher.launch(vpnPermissionIntent)
+            return
+        }
+
         setUiState(State.CONNECTING)
 
         val intent = Intent(this, ANetVpnService::class.java)
         intent.action = ANetVpnService.ACTION_CONNECT
-        intent.putExtra("CONFIG", selectedConfigContent)
+        val source = selectedConfigContent ?: return
+        intent.putExtra("CONFIG", connectionConfigForCurrentNetwork(source))
         intent.putExtra("SELECTED_SERVER", selectedServerName)
 
         val prefs = getSharedPreferences("anet_prefs", Context.MODE_PRIVATE)
@@ -912,6 +1299,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopVpnService() {
+        pendingTuning = null
+        tuningVerificationGeneration++
         mainHandler.removeCallbacks(connectTimeoutRunnable)
         val intent = Intent(this, ANetVpnService::class.java)
         intent.action = ANetVpnService.ACTION_STOP
@@ -1874,6 +2263,29 @@ timeout_secs = 10$sshLine
             }
         }
 
+        // Import this wire-compatible operator profile once after an APK update.
+        // Preserve all existing profiles and user edits for rollback.
+        if (prefs.getString("bundled_profile_revision", null) != "gw2-2444-v1") {
+            try {
+                val bundled = assets.open("default-client.toml").bufferedReader().use { it.readText() }
+                if (bundled.contains("legacy_padding_tag = true") && inspectServers(bundled, reportError = false) != null) {
+                    val item = ConfigItem(name = "gw2", content = bundled)
+                    configs.add(item)
+                    // Make the verified compatible profile active; preserve every
+                    // pre-existing profile in the list for manual rollback.
+                    saveConfigsToPrefs(configs, item.id)
+                    prefs.edit()
+                        .putString("bundled_profile_revision", "gw2-2444-v1")
+                        .putString("active_config_id", item.id)
+                        .apply()
+                    logToConsole("Выбран профиль gw2 с совместимым протоколом; прежние профили сохранены")
+                }
+            } catch (_: java.io.FileNotFoundException) {
+                // Public APKs do not contain operator credentials.
+            } catch (e: Exception) {
+                logToConsole("Не удалось загрузить совместимый профиль gw2: ${e.javaClass.simpleName}")
+            }
+        }
         val activeId = prefs.getString("active_config_id", null)
         val activeItem = configs.find { it.id == activeId } ?: configs.firstOrNull()
 

@@ -12,3 +12,9 @@ local.properti
 /jniLibs
 /app/src/main/assets/default-client.toml
 /app/keystore/*.jks
+
+# Local build/checkpoint artifacts
+/.kotlin/
+/dist/
+/native-backups/
+/tools/dpi-helper/dist/
