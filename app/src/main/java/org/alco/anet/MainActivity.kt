@@ -1095,7 +1095,7 @@ class MainActivity : AppCompatActivity() {
 
         setUiState(State.DISCONNECTED)
 
-        findViewById<TextView>(R.id.versionLabel).text = getAppVersion()
+        findViewById<TextView>(R.id.versionLabel).text = packageManager.getPackageInfo(packageName, 0).versionName
         findViewById<TextView>(R.id.buildDetailLabel).text = getBuildInfo()
 
         connectButton.setupTvFocusAnimator()
