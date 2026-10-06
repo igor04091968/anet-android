@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the diagnostic package on the USB workspace; no device/server access.
 set -eu
-build_number=${1:-3}
+build_number=${1:-4}
 case "$build_number" in ''|*[!0-9]*) echo 'Expected a numeric build number' >&2; exit 2;; esac
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 native_dir=${ANET_NATIVE_SOURCE:-"$project_dir/../anet-vpn"}
